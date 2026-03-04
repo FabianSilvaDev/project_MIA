@@ -19,7 +19,7 @@ while True:
     if not user_input:
         continue
 
-    if user_input.lower() in ["salir", "exit", "adiós", "hasta pronto"]:
+    if user_input.lower() in ["salir", "exit", "adiós", "hasta pronto", "chao mia"]:
         print("Mia: Hasta pronto, señor.")
         speak("Hasta pronto, señor.")
         break
