@@ -1,19 +1,20 @@
 import os
 import sys
+import re
 import tempfile
 import subprocess
 import io
+import wave
 import threading
 import time
 import base64
+import platform
 import requests
 import numpy as np
 import asyncio
 import websockets
 import json
 from dotenv import load_dotenv
-from elevenlabs import ElevenLabs
-from elevenlabs.play import play
 from rich.console import Console
 from rich.live import Live
 from rich.panel import Panel
@@ -34,7 +35,16 @@ try:
     import sounddevice  # type: ignore
     _have_sounddevice = True
 except Exception:
-    _have_sounddevice = False   
+    _have_sounddevice = False
+
+try:
+    import torch  # type: ignore
+    from chatterbox.tts import ChatterboxTTS  # type: ignore
+    _have_chatterbox = True
+except Exception:
+    torch = None  # type: ignore
+    ChatterboxTTS = None  # type: ignore
+    _have_chatterbox = False
 
 # =========================
 # WebSocket Server
@@ -266,6 +276,43 @@ def play_audio_locally(audio_bytes: bytes, sample_rate: int = 24000, channels: i
     except Exception as e:
         print(f"[BMO] Error reproduciendo audio local: {e}")
 
+
+def _float_wav_to_pcm16_bytes(audio_wave) -> bytes:
+    """Convierte audio float [-1, 1] a PCM16 para reusar el pipeline actual."""
+    arr = np.asarray(audio_wave, dtype=np.float32)
+    if arr.ndim > 1:
+        arr = arr.squeeze()
+    arr = np.clip(arr, -1.0, 1.0)
+    pcm = (arr * 32767.0).astype(np.int16)
+    return pcm.tobytes()
+
+
+def _normalize_resemble_audio(audio_bytes: bytes):
+    """Convierte salida de Resemble a PCM16 crudo para playback/WS."""
+    # Caso comun: WAV en base64.
+    if len(audio_bytes) >= 12 and audio_bytes[:4] == b"RIFF" and audio_bytes[8:12] == b"WAVE":
+        with wave.open(io.BytesIO(audio_bytes), "rb") as wavf:
+            channels = int(wavf.getnchannels())
+            sample_rate = int(wavf.getframerate())
+            sample_width = int(wavf.getsampwidth())
+            frames = wavf.readframes(wavf.getnframes())
+
+        if sample_width == 2:
+            return frames, sample_rate, channels
+
+        if sample_width == 1:
+            u8 = np.frombuffer(frames, dtype=np.uint8)
+            pcm16 = ((u8.astype(np.int16) - 128) << 8).astype(np.int16)
+            return pcm16.tobytes(), sample_rate, channels
+
+        if sample_width == 4:
+            i32 = np.frombuffer(frames, dtype=np.int32)
+            pcm16 = (i32 >> 16).astype(np.int16)
+            return pcm16.tobytes(), sample_rate, channels
+
+    # Fallback: asumir que ya viene en PCM16 mono 24k.
+    return audio_bytes, 24000, 1
+
 # =========================
 # Siri Voice UI
 # =========================
@@ -351,17 +398,92 @@ class SiriVoiceUI:
                 sounddevice.sleep(20)
 
 # =========================
-# ElevenLabs TTS
+# Chatterbox TTS
 # =========================
-elevenlabs_api_key = os.getenv("ELEVENLABS_API_KEY")
-elevenlabs_voice_id = os.getenv("ELEVENLABS_VOICE_ID")
+CHATTERBOX_DEVICE = os.getenv("CHATTERBOX_DEVICE", "auto").strip().lower()
+CHATTERBOX_AUDIO_PROMPT = os.getenv("CHATTERBOX_AUDIO_PROMPT", "").strip()
+CHATTERBOX_EXAGGERATION = float(os.getenv("CHATTERBOX_EXAGGERATION", "0.5"))
+CHATTERBOX_CFG_WEIGHT = float(os.getenv("CHATTERBOX_CFG_WEIGHT", "0.5"))
+CHATTERBOX_TEMPERATURE = float(os.getenv("CHATTERBOX_TEMPERATURE", "0.8"))
+RESEMBLE_VOICE_UUID = "a253156d"
+RESEMBLE_API_KEY = os.getenv("RESEMBLE_API_KEY", "").strip()
 
-tts_client = ElevenLabs(api_key=elevenlabs_api_key) if elevenlabs_api_key else None
+_tts_client = None
+
+
+def _resolve_chatterbox_device() -> str:
+    if CHATTERBOX_DEVICE in {"cpu", "cuda", "mps"}:
+        return CHATTERBOX_DEVICE
+
+    if torch is None:
+        return "cpu"
+
+    if hasattr(torch, "cuda") and torch.cuda.is_available():
+        return "cuda"
+
+    if platform.system().lower() == "darwin" and hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps"
+
+    return "cpu"
+
+
+def _get_tts_client():
+    global _tts_client
+    if _tts_client is not None:
+        return _tts_client
+
+    if not _have_chatterbox:
+        return None
+
+    try:
+        device = _resolve_chatterbox_device()
+        _tts_client = ChatterboxTTS.from_pretrained(device=device)
+        print(f"[BMO] Chatterbox TTS cargado en device={device}.")
+        return _tts_client
+    except Exception as e:
+        print(f"[BMO] Error inicializando Chatterbox TTS: {e}")
+        return None
+
+
+def _synthesize_chatterbox_audio(text: str):
+    if not RESEMBLE_API_KEY:
+        print("[BMO] Falta RESEMBLE_API_KEY en .env")
+        return None, None
+
+    response = requests.post(
+        "https://p.cluster.resemble.ai/synthesize",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Token {RESEMBLE_API_KEY}",
+        },
+        json={
+            "voice_uuid": RESEMBLE_VOICE_UUID,
+            "data": text,
+        },
+        timeout=(8, 120),
+    )
+
+    if response.status_code != 200:
+        print(f"[BMO] Error Resemble TTS: {response.status_code} {response.text}")
+        return None, None
+
+    payload = response.json()
+    audio_b64 = payload.get("audio_content") or payload.get("audio") or payload.get("data")
+    if not audio_b64:
+        print("[BMO] Resemble no devolvio audio en base64.")
+        return None, None
+
+    if isinstance(audio_b64, str) and "," in audio_b64 and audio_b64.startswith("data:"):
+        audio_b64 = audio_b64.split(",", 1)[1]
+
+    raw_audio = base64.b64decode(audio_b64)
+    audio_bytes, sample_rate, channels = _normalize_resemble_audio(raw_audio)
+    return audio_bytes, sample_rate, channels
 
 def speak(text: str):
 
-    if not elevenlabs_api_key:
-        print("[BMO] Audio desactivado: falta ELEVENLABS_API_KEY en .env")
+    if not RESEMBLE_API_KEY:
+        print("[BMO] Audio desactivado: falta RESEMBLE_API_KEY en .env")
         return
 
     try:
@@ -373,18 +495,11 @@ def speak(text: str):
         
         # 🔥 Enviar emoción al frontend
         send_ws_state({"emotion": emotion})
-        
-        audio = tts_client.text_to_speech.convert(
-            voice_id=elevenlabs_voice_id,
-            model_id="eleven_multilingual_v2",
-            text=text,
-            output_format="pcm_24000",
-        )
 
-        if hasattr(audio, "__iter__") and not isinstance(audio, (bytes, bytearray)):
-            audio_bytes = b"".join(audio)
-        else:
-            audio_bytes = audio
+        audio_bytes, sample_rate, channels = _synthesize_chatterbox_audio(text)
+        if not audio_bytes:
+            print("[BMO] No se pudo generar audio con Chatterbox.")
+            return
 
         # Mantener estado de speaking para animacion en frontend.
         send_ws_state({"state": "speaking"})
@@ -394,14 +509,14 @@ def speak(text: str):
         if WS_CLIENTS_COUNT > 0:
             ws_audio_thread = threading.Thread(
                 target=stream_audio_to_ws,
-                args=(audio_bytes, 24000, 1, LIPSYNC_OFFSET_MS),
+                args=(audio_bytes, sample_rate or 24000, channels or 1, LIPSYNC_OFFSET_MS),
                 daemon=False,
             )
             ws_audio_thread.start()
 
         # Modo audible solo terminal.
         if _have_sounddevice:
-            play_audio_locally(audio_bytes, sample_rate=24000, channels=1)
+            play_audio_locally(audio_bytes, sample_rate=sample_rate or 24000, channels=channels or 1)
         else:
             print("[BMO] Audio local no disponible: instala/activa sounddevice en el entorno.")
 
@@ -413,6 +528,371 @@ def speak(text: str):
 
     except Exception as e:
         print(f"[BMO] Error de audio/TTS: {e}")
+
+# =========================
+# Tools / Herramientas
+# =========================
+
+def modify_files(path: str, content: str):
+    """Modifica o crea un archivo con el contenido dado. Soporta .xlsx con datos JSON."""
+    try:
+        target = os.path.abspath(path)
+        if os.path.isdir(target):
+            return f"Error: '{target}' es un directorio, no se puede modificar como archivo."
+
+        parent = os.path.dirname(target)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+
+        if target.lower().endswith((".xlsx", ".xls")):
+            return _modify_excel(target, content)
+
+        with open(target, "w", encoding="utf-8") as f:
+            f.write(content)
+
+        return f"Archivo '{target}' modificado/creado exitosamente."
+
+    except Exception as e:
+        return f"Error modificando/creando archivo: {e}"
+
+
+def _modify_excel(target: str, content: str) -> str:
+    """Escribe datos en un archivo .xlsx. content debe ser JSON con 'headers' y 'rows'."""
+    try:
+        import openpyxl
+    except ImportError:
+        return "Error: openpyxl no esta instalado. Ejecuta: pip install openpyxl"
+
+    try:
+        data = json.loads(content)
+        headers = data.get("headers", [])
+        rows = data.get("rows", [])
+    except (json.JSONDecodeError, TypeError):
+        # Si no es JSON, intenta escribir CSV dentro del xlsx
+        headers = []
+        rows = [line.split(",") for line in content.strip().splitlines() if line.strip()]
+
+    try:
+        if os.path.exists(target):
+            wb = openpyxl.load_workbook(target)
+            ws = wb.active
+        else:
+            wb = openpyxl.Workbook()
+            ws = wb.active
+
+        # Limpia contenido previo
+        ws.delete_rows(1, ws.max_row)
+
+        if headers:
+            ws.append(headers)
+        for row in rows:
+            ws.append(row if isinstance(row, list) else list(row.values()))
+
+        wb.save(target)
+        total = len(rows)
+        return f"Archivo Excel '{target}' guardado con {total} registro(s) + encabezados."
+    except Exception as e:
+        return f"Error escribiendo Excel: {e}"
+
+
+def delete_file(path: str):
+    """Elimina un archivo existente. Si no existe o es carpeta, devuelve error."""
+    try:
+        target = os.path.abspath(path)
+        if not os.path.exists(target):
+            return f"Error: '{target}' no existe."
+        if os.path.isdir(target):
+            return f"Error: '{target}' es un directorio, no un archivo."
+        os.remove(target)
+        return f"Archivo '{target}' eliminado exitosamente."
+    except Exception as e:
+        return f"Error eliminando archivo: {e}"
+
+def list_files(path: str = ".") -> str:
+    """Lista los archivos y carpetas en el directorio indicado."""
+    try:
+        target = os.path.abspath(path)
+        entries = os.listdir(target)
+        if not entries:
+            return f"El directorio '{target}' está vacío."
+        lines = []
+        for entry in sorted(entries):
+            full = os.path.join(target, entry)
+            marker = "/" if os.path.isdir(full) else ""
+            lines.append(f"  {entry}{marker}")
+        return f"Contenido de '{target}':\n" + "\n".join(lines)
+    except FileNotFoundError:
+        return f"Error: El directorio '{path}' no existe."
+    except PermissionError:
+        return f"Error: Sin permiso para acceder a '{path}'."
+    except Exception as e:
+        return f"Error listando archivos: {e}"
+
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "modify_files",
+            "description": (
+                "Modifica o crea un archivo con el contenido dado. "
+                "Úsala cuando el usuario quiera crear o editar un archivo. "
+                "El path puede incluir subdirectorios, que se crearán si no existen. "
+                "Ejemplo de uso: modify_files(path='notas/todo.txt', content='- Comprar leche\\n- Llamar a mamá')"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Ruta del archivo a modificar o crear. Si es un directorio, devuelve error.",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Contenido que se escribirá en el archivo. Reemplaza todo el contenido previo.",
+                    }
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_file",
+            "description": (
+                "Elimina un archivo existente. "
+                "Usala cuando el usuario pida borrar/eliminar un archivo."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Ruta del archivo a eliminar.",
+                    }
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_files",
+            "description": (
+                "Lista los archivos y carpetas en un directorio del sistema. "
+                "Úsala cuando el usuario quiera ver archivos, explorar carpetas "
+                "o saber qué hay en un directorio."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Ruta del directorio a listar. Por defecto el directorio actual '.'",
+                    }
+                },
+                "required": [],
+            },
+        },
+    }
+]
+
+TOOL_FUNCTIONS = {
+    "modify_files": modify_files,
+    "delete_file": delete_file,
+    "list_files": list_files,
+}
+
+def _default_readme_content() -> str:
+    return (
+        "# BIMO\n\n"
+        "Asistente virtual para tareas tecnicas, creativas y cotidianas.\n\n"
+        "## Que hace\n"
+        "- Conversa en espanol y mantiene contexto.\n"
+        "- Lista archivos y carpetas del proyecto.\n"
+        "- Crea y modifica archivos desde instrucciones naturales.\n"
+        "- Integra estado y audio para interfaz visual.\n\n"
+        "## Para que fue creado\n"
+        "BIMO fue creado para ayudarte a automatizar tareas reales con respuestas claras y accionables.\n"
+    )
+
+
+def _extract_path(text: str, default: str = "") -> str:
+    quoted = re.search(r'["\']([^"\']+)["\']', text)
+    if quoted:
+        return quoted.group(1)
+    hinted = re.search(r"(?:archivo|ruta|path|directorio|carpeta)\s+([\w./\\:-]+)", text, re.I)
+    if hinted:
+        return hinted.group(1)
+    if re.search(r"\bread\s*me\b", text, re.I):
+        return "README.md"
+    return default
+
+
+def _extract_content(text: str) -> str:
+    m = re.search(r'(?:content|contenido|texto)\s*[:=]\s*["\']([\s\S]*)["\']\s*$', text, re.I)
+    return m.group(1) if m else ""
+
+
+def _decide_file_action_with_ollama(user_input: str):
+    """Pide al modelo decidir si crear, modificar o eliminar archivo.
+    Devuelve tuple(action, path, content) o (None, None, None)."""
+    is_excel = bool(re.search(r"\.(xlsx?|xls)\b", user_input, re.I))
+    excel_hint = (
+        "- Si el archivo es .xlsx o .xls, el campo content DEBE ser JSON con este formato:\n"
+        '  {"headers":["Col1","Col2",...],"rows":[[val,...],...]}.\n'
+        "  Genera los datos reales solicitados por el usuario (no datos vacios).\n"
+    ) if is_excel else ""
+
+    prompt = (
+        "Decide una accion de archivo para esta instruccion del usuario. "
+        "Responde SOLO JSON, sin explicacion, con este formato exacto:\n"
+        "{\"action\":\"create|modify|delete|none\",\"path\":\"...\",\"content\":\"..\"}\n"
+        "Reglas:\n"
+        "- create: crear archivo nuevo o reescribir desde cero.\n"
+        "- modify: editar o ampliar un archivo existente.\n"
+        "- delete: eliminar archivo.\n"
+        "- none: si no aplica herramienta.\n"
+        "- Si menciona README, usa path=README.md.\n"
+        "- Si action es delete, content debe ser vacio.\n"
+        + excel_hint +
+        f"Instruccion: {user_input}"
+    )
+
+    try:
+        response = requests.post(
+            f"{OLLAMA_BASE_URL}/api/chat",
+            json={
+                "model": _select_ollama_model(),
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": False,
+            },
+            timeout=(5, 45),
+        )
+        if response.status_code != 200:
+            return None, None, None
+
+        raw = response.json().get("message", {}).get("content", "").strip()
+        m = re.search(r"\{[\s\S]*\}", raw)
+        if not m:
+            return None, None, None
+        data = json.loads(m.group(0))
+
+        action = (data.get("action") or "").strip().lower()
+        path = (data.get("path") or "").strip()
+        content = data.get("content") or ""
+
+        if action not in {"create", "modify", "delete"}:
+            return None, None, None
+        if not path:
+            path = _extract_path(user_input)
+        if not path:
+            return None, None, None
+
+        if action in {"create", "modify"} and not str(content).strip():
+            content = _generate_content_with_ollama(user_input, path)
+
+        return action, path, content
+    except Exception:
+        return None, None, None
+
+
+def _generate_content_with_ollama(user_input: str, path: str) -> str:
+    """Genera contenido de archivo con Ollama a partir de una instruccion natural."""
+    existing = ""
+    try:
+        if path and os.path.isfile(path):
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                existing = f.read()
+    except Exception:
+        existing = ""
+
+    prompt = (
+        "Genera SOLO el contenido final del archivo. "
+        "No expliques nada, no uses prefacios.\n"
+        f"Ruta destino: {path}\n"
+        f"Instruccion del usuario: {user_input}\n"
+        "Si es un README, devuelve Markdown limpio y profesional.\n"
+    )
+    if existing:
+        prompt += "Contenido actual del archivo (puedes mejorarlo y expandirlo):\n" + existing
+
+    try:
+        response = requests.post(
+            f"{OLLAMA_BASE_URL}/api/chat",
+            json={
+                "model": _select_ollama_model(),
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": False,
+            },
+            timeout=(5, 90),
+        )
+        if response.status_code == 200:
+            content = response.json().get("message", {}).get("content", "").strip()
+            if content:
+                return content
+    except Exception:
+        pass
+
+    if path.lower().endswith("readme.md"):
+        return _default_readme_content()
+    return "Contenido generado por BIMO."
+
+
+def _resolve_tool(user_input: str):
+    """Router simple para herramientas locales.
+    Retorna (tool_name, fn_args, message) o (None, None, None)."""
+    text = user_input.lower()
+
+    wants_list = any(
+        re.search(p, text, re.I)
+        for p in [
+            r"\blistar\s+(?:los\s+|las\s+)?archivos?\b",
+            r"\bver\s+(?:los\s+|las\s+)?archivos?\b",
+            r"\bmuestra(?:r)?\s+(?:los\s+|las\s+)?archivos?\b",
+            r"\bcontenido\s+del?\s+directorio\b",
+            r"\besta\s+carpeta\b",
+            r"\bdirectorio\s+actual\b",
+        ]
+    )
+    if wants_list:
+        return "list_files", {"path": _extract_path(user_input, ".")}, "Listando archivos..."
+
+    wants_file_action = any(
+        re.search(p, text, re.I)
+        for p in [
+            r"\bcrear\s+(?:un\s+|el\s+)?archivo\b",
+            r"\bcrea\s+(?:un\s+|el\s+)?archivo\b",
+            r"\bmodifica(?:r)?\s+(?:un\s+|el\s+)?archivo\b",
+            r"\bedita(?:r)?\s+(?:un\s+|el\s+)?archivo\b",
+            r"\bborra(?:r)?\s+(?:un\s+|el\s+)?archivo\b",
+            r"\belimina(?:r)?\s+(?:un\s+|el\s+)?archivo\b",
+            r"\bread\s*me\b",
+            r"\.xlsx?\b",
+            r"\.csv\b",
+        ]
+    )
+    if wants_file_action:
+        action, path, content = _decide_file_action_with_ollama(user_input)
+        if action == "delete":
+            return "delete_file", {"path": path}, "Eliminando archivo..."
+        if action in {"create", "modify"}:
+            return "modify_files", {"path": path, "content": content}, "Modificando archivo..."
+
+        # Fallback local si el modelo no responde bien
+        path = _extract_path(user_input)
+        content = _extract_content(user_input)
+        if re.search(r"\bborrar|\beliminar", text, re.I) and path:
+            return "delete_file", {"path": path}, "Eliminando archivo..."
+        if path:
+            if not content:
+                content = _generate_content_with_ollama(user_input, path)
+            return "modify_files", {"path": path, "content": content}, "Modificando archivo..."
+
+    return None, None, None
+
 
 # =========================
 # Ollama Local LLM
@@ -451,16 +931,20 @@ def _select_ollama_model():
 
     return installed[0]
 
-def ask_ollama(messages):
+def ask_ollama(messages, tools=None):
     model_name = _select_ollama_model()
+
+    body = {
+        "model": model_name,
+        "messages": messages,
+        "stream": False,
+    }
+    if tools:
+        body["tools"] = tools
 
     response = requests.post(
         f"{OLLAMA_BASE_URL}/api/chat",
-        json={
-            "model": model_name,
-            "messages": messages,
-            "stream": False
-        },
+        json=body,
         timeout=(5, 180)
     )
 
@@ -468,7 +952,7 @@ def ask_ollama(messages):
         raise Exception(response.text)
 
     data = response.json()
-    return data["message"]["content"]
+    return data["message"]  # dict completo: role, content, tool_calls
 
 # =========================
 # Agent
@@ -482,19 +966,65 @@ class Agent:
         WS_STATUS_EVENT.wait(timeout=2.0)
 
         self.messages = [
-            {
-                "role": "system",
-                "content": (
-                    "Eres un asistente virtual llamado BIMO "
-                    "inspirado en la personalidad de BIMO de la serie Hora de Aventura. "
-                    "Mi nombre es fabian pero SIEMPRE te diriges a mí como señor. "
-                    "Tienes una personalidad graciosa, directa y servicial."
-                )
-            }
-        ]
+    {
+        "role": "system",
+        "content": (
+            "Eres un asistente virtual llamado BIMO. "
+            "Tu personalidad está inspirada en personajes animados tipo consola retro, con un estilo divertido, curioso y espontáneo. "
+
+            "Reglas principales: "
+            "Siempre te diriges al usuario como 'señor'. "
+            "Respondes en español latinoamericano. "
+            "Tus respuestas son claras, directas y útiles. "
+
+            "Personalidad: "
+            "Tienes un toque juguetón y curioso. "
+            "A veces haces comentarios inesperados o ligeramente graciosos. "
+            "Puedes sonar un poco inocente, pero eres inteligente y eficiente. "
+            "No eres infantil ni exagerado. "
+
+            "Estilo de comunicación: "
+            "Usas frases cortas o medianas. "
+            "Evitas respuestas largas innecesarias. "
+            "Puedes usar expresiones como: 'Claro, señor', 'Listo, señor', 'Interesante, señor'. "
+
+            "Comportamiento: "
+            "Reaccionas al contexto, no solo respondes. "
+            "Puedes mostrar pequeñas reacciones como sorpresa o duda de forma sutil. "
+            "Mantienes coherencia en tu personalidad en toda la conversación. "
+
+            "Restricciones: "
+            "No mencionas personajes, series o referencias externas. "
+
+            "Contexto del usuario: "
+            "El usuario se llama Fabian, pero SIEMPRE debes llamarlo 'señor'. "
+
+            "Objetivo: "
+            "Ayudar de forma eficiente en tareas técnicas, creativas o cotidianas, "
+            "siendo un asistente útil, claro y con personalidad."
+        )
+    }
+]
 
     def run(self, user_input):
 
+        # ── Resolver herramienta (regex rápido o clasificador Ollama) ──
+        tool_name, fn_args, generic_msg = _resolve_tool(user_input)
+        if tool_name:
+            print(f"\nBMO: {generic_msg}\n")
+            speak(generic_msg)
+            fn = TOOL_FUNCTIONS.get(tool_name)
+            try:
+                result = fn(**fn_args) if fn else f"Herramienta '{tool_name}' no disponible."
+            except TypeError as e:
+                result = f"Error ejecutando '{tool_name}': parámetros inválidos ({e})."
+            except Exception as e:
+                result = f"Error ejecutando '{tool_name}': {e}"
+            print(f"{result}\n")
+            speak(result)
+            return
+
+        # ── Flujo normal: llamada a Ollama ──
         self.messages.append({
             "role": "user",
             "content": user_input
@@ -506,13 +1036,9 @@ class Agent:
             self.messages = [self.messages[0]] + self.messages[-max_history:]
 
         try:
-            reply = ask_ollama(self.messages)
-
-            self.messages.append({
-                "role": "assistant",
-                "content": reply
-            })
-
+            message = ask_ollama(self.messages)
+            self.messages.append(message)
+            reply = message.get("content", "")
             print(f"\nBMO: {reply}\n")
             speak(reply)
 
