@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>BMO Avatar</title>
+  <style>
+    html, body {
+      margin: 0;
+      height: 100%;
+      background: #81d2bc;
+      overflow: hidden;
+      font-family: Arial, sans-serif;
+    }
+
+    body {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    #status {
+      position: fixed;
+      top: 10px;
+      left: 10px;
+      padding: 8px 10px;
+      border-radius: 8px;
+      background: rgba(0, 0, 0, 0.55);
+      color: #fff;
+      font-size: 13px;
+      z-index: 10;
+    }
+  </style>
+</head>
+<body>
+  <div id="status">Cargando avatar...</div>
+
+  <script>
+    const statusEl = document.getElementById("status");
+
+    window.addEventListener("error", (event) => {
+      statusEl.textContent = `Error JS: ${event.message}`;
+    });
+
+    function loadScript(src) {
+      return new Promise((resolve, reject) => {
+        const script = document.createElement("script");
+        script.src = src;
+        script.onload = resolve;
+        script.onerror = () => reject(new Error(`No se pudo cargar ${src}`));
+        document.head.appendChild(script);
+      });
+    }
+
+    async function boot() {
+      try {
+        await loadScript("./node_modules/pixi.js/dist/pixi.min.js");
+        await loadScript("./mia-avatar.js");
+
+        // Confirmar que el script cargo y que el canvas quedo listo.
+        setTimeout(() => {
+          if (window.__MIA_AVATAR_ERROR__) {
+            statusEl.textContent = `Avatar error: ${window.__MIA_AVATAR_ERROR__}`;
+            return;
+          }
+
+          if (window.__MIA_AVATAR_READY__) {
+            statusEl.textContent = "Avatar cargado y listo.";
+            let lastTicks = -1;
+            setInterval(() => {
+              if (!window.__MIA_AVATAR_READY__) {
+                return;
+              }
+
+              const ticks = Number(window.__MIA_AVATAR_TICKS__ || 0);
+              if (ticks === lastTicks) {
+                statusEl.textContent = `Avatar listo, pero render detenido (frames: ${ticks})`;
+              } else {
+                statusEl.textContent = `Avatar activo (frames: ${ticks})`;
+              }
+              lastTicks = ticks;
+            }, 1000);
+            return;
+          }
+
+          if (window.__MIA_AVATAR_LOADED__) {
+            statusEl.textContent = "Avatar script cargado, inicializando...";
+            return;
+          }
+
+          statusEl.textContent = "Avatar no cargo.";
+        }, 350);
+      } catch (error) {
+        statusEl.textContent = error.message;
+      }
+    }
+
+    boot();
+  </script>
+</body>
+</html>
